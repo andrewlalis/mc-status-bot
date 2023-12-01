@@ -8,27 +8,28 @@ import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.OnlineStatus;
 import net.dv8tion.jda.api.entities.Activity;
-import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import net.dv8tion.jda.api.utils.cache.CacheFlag;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 public class ServerBot implements Runnable {
     private final JDA jda;
     private final String serverIp;
-    private final long channelId;
+    private final short serverPort;
     private final ServerStatusFetcher serverStatusFetcher;
 
-    private int lastPlayerCount = -1;
-    private final Set<String> lastPlayerNames = new HashSet<>();
-
-    public ServerBot(JDA jda, String serverIp, long channelId, ServerStatusFetcher serverStatusFetcher) {
+    public ServerBot(JDA jda, String serverIp, short serverPort, ServerStatusFetcher serverStatusFetcher) {
         this.jda = jda;
         this.serverIp = serverIp;
-        this.channelId = channelId;
+        this.serverPort = serverPort;
         this.serverStatusFetcher = serverStatusFetcher;
     }
 
@@ -47,14 +48,22 @@ public class ServerBot implements Runnable {
         ArrayNode serversArray = configData.withArray("servers");
         List<ServerBot> bots = new ArrayList<>(serversArray.size());
         ServerStatusFetcher serverStatusFetcher = new ServerStatusFetcher();
+        var virtualPool = Executors.newVirtualThreadPerTaskExecutor();
         for (JsonNode node : serversArray) {
             String token = node.get("discord-token").asText();
             String serverIp = node.get("server-ip").asText();
-            long channelId = node.get("channel-id").asLong();
+            short serverPort = node.get("server-port").shortValue();
             JDABuilder builder = JDABuilder.create(token, Collections.emptyList());
-            builder.disableCache(CacheFlag.ACTIVITY, CacheFlag.VOICE_STATE);
+            builder.disableCache(
+                    CacheFlag.ACTIVITY, CacheFlag.VOICE_STATE, CacheFlag.EMOJI,
+                    CacheFlag.STICKER, CacheFlag.CLIENT_STATUS, CacheFlag.ONLINE_STATUS,
+                    CacheFlag.SCHEDULED_EVENTS
+            );
+            builder.setCallbackPool(virtualPool);
+            builder.setEventPool(virtualPool);
+            builder.setRateLimitElastic(virtualPool, true);
             JDA jda = builder.build();
-            bots.add(new ServerBot(jda, serverIp, channelId, serverStatusFetcher));
+            bots.add(new ServerBot(jda, serverIp, serverPort, serverStatusFetcher));
         }
         return bots;
     }
@@ -68,13 +77,13 @@ public class ServerBot implements Runnable {
         }
         while (true) {
             try {
-                ServerStatus status = serverStatusFetcher.fetch(serverIp);
+                ServerStatus status = serverStatusFetcher.fetchViaSocket(serverIp, serverPort);
                 displayStatus(status);
             } catch (IOException e) {
                 handleError(e);
             }
             try {
-                Thread.sleep(10000);
+                Thread.sleep(5000);
             } catch (InterruptedException e) {
                 e.printStackTrace(System.err);
                 Thread.currentThread().interrupt();
@@ -83,11 +92,10 @@ public class ServerBot implements Runnable {
     }
 
     private void displayStatus(ServerStatus status) {
-        String text = String.format("%d/%d players", status.playersOnline(), status.maxPlayers());
         OnlineStatus onlineStatus = jda.getPresence().getStatus();
         OnlineStatus newOnlineStatus = status.playersOnline() > 0 ? OnlineStatus.ONLINE : OnlineStatus.IDLE;
         Activity activity = jda.getPresence().getActivity();
-        Activity newActivity = Activity.customStatus(text);
+        Activity newActivity = Activity.customStatus(formatStatusText(status));
 
         boolean shouldUpdate = onlineStatus != newOnlineStatus ||
                 activity == null ||
@@ -95,31 +103,17 @@ public class ServerBot implements Runnable {
         if (shouldUpdate) {
             jda.getPresence().setPresence(newOnlineStatus, newActivity);
         }
+    }
 
-        if (lastPlayerCount != -1 && lastPlayerCount != status.playersOnline()) {
-            final TextChannel channel = jda.getTextChannelById(channelId);
-            for (String name : getPlayersJoined(status.playerNames())) {
-                channel.sendMessage(name + " joined the server.").queue();
-            }
-            for (String name : getPlayersLeft(status.playerNames())) {
-                channel.sendMessage(name + " left the server.").queue();
-            }
-            lastPlayerCount = status.playersOnline();
-            lastPlayerNames.clear();
-            lastPlayerNames.addAll(status.playerNames());
+    private String formatStatusText(ServerStatus status) {
+        if (status.playerNames().isEmpty()) {
+            return "0 players online.";
         }
-    }
-
-    private Set<String> getPlayersJoined(Set<String> current) {
-        Set<String> set = new HashSet<>(current);
-        set.removeAll(lastPlayerNames);
-        return set;
-    }
-
-    private Set<String> getPlayersLeft(Set<String> current) {
-        Set<String> set = new HashSet<>(lastPlayerNames);
-        set.removeAll(current);
-        return set;
+        String playerNames = "\uD83C\uDFAE " + status.playerNames().stream().sorted().collect(Collectors.joining(", "));
+        if (playerNames.length() > Activity.MAX_ACTIVITY_NAME_LENGTH) {
+            return playerNames.substring(0, Activity.MAX_ACTIVITY_NAME_LENGTH - 3) + "...";
+        }
+        return playerNames;
     }
 
     private void handleError(IOException e) {
@@ -128,7 +122,5 @@ public class ServerBot implements Runnable {
             jda.getPresence().setActivity(Activity.customStatus("Error."));
         }
         e.printStackTrace(System.err);
-        lastPlayerCount = -1;
-        lastPlayerNames.clear();
     }
 }

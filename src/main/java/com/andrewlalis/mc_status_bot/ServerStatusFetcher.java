@@ -1,48 +1,68 @@
 package com.andrewlalis.mc_status_bot;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import com.andrewlalis.mc_status_bot.server_prot.ServerProtocol;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.concurrent.Executors;
+import java.io.*;
+import java.net.Socket;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 public class ServerStatusFetcher {
-    private final HttpClient client = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(3))
-            .executor(Executors.newVirtualThreadPerTaskExecutor())
-            .build();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public ServerStatus fetch(String ip) throws IOException {
-        HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.mcsrvstat.us/3/" + ip))
-                .GET()
-                .timeout(Duration.ofSeconds(5))
-                .build();
-        try {
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() != 200) throw new IOException("Non-200 status code: " + response.statusCode());
-            ObjectNode data = objectMapper.readValue(response.body(), ObjectNode.class);
-            Set<String> playerNames = new HashSet<>();
-            ArrayNode playersArray = data.get("players").withArray("list");
-            for (JsonNode node : playersArray) {
-                playerNames.add(node.get("name").asText());
+    public ServerStatus fetchViaSocket(String ip, short port) throws IOException {
+//        long start = System.currentTimeMillis();
+        try (var socket = new Socket(ip, port)) {
+            OutputStream sOut = socket.getOutputStream();
+            InputStream sIn = socket.getInputStream();
+
+            // Send the handshake request.
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ServerProtocol.writeVarInt(out, 0x00); // Handshake packet id.
+            ServerProtocol.writeVarInt(out, 764); // Protocol version for 1.20.2.
+            ServerProtocol.writeString(out, ip);
+            new DataOutputStream(out).writeShort(25565);
+            ServerProtocol.writeVarInt(out, 1); // Next-state enum: 1 for Status.
+
+            ServerProtocol.writeVarInt(sOut, out.size());
+            sOut.write(out.toByteArray());
+            sOut.flush();
+
+            // Immediately send status request.
+            out.reset();
+            ServerProtocol.writeVarInt(out, 0x00);
+            ServerProtocol.writeVarInt(sOut, out.size());
+            sOut.write(out.toByteArray());
+            sOut.flush();
+
+            // Receive the status response.
+            int responsePacketSize = ServerProtocol.readVarInt(sIn);
+            byte[] packetIdAndData = new byte[responsePacketSize];
+            int bytesRead = 0;
+            int attempts = 0;
+            while (bytesRead < responsePacketSize) {
+                bytesRead += sIn.read(packetIdAndData, bytesRead, packetIdAndData.length - bytesRead);
+                attempts++;
+                if (attempts > 100) break;
             }
+            if (bytesRead != responsePacketSize) throw new IOException("Couldn't read full packet. Read " + bytesRead + " instead of " + responsePacketSize);
+            ByteArrayInputStream in = new ByteArrayInputStream(packetIdAndData);
+            int packetId = ServerProtocol.readVarInt(in);
+            if (packetId != 0x00) throw new IOException("Received invalid packetId when receiving status response: " + packetId);
+            String jsonData = ServerProtocol.readString(in);
+//            long dur = System.currentTimeMillis() - start;
+//            System.out.println("Received server status in " + dur + " ms.");
+            ObjectNode obj = objectMapper.readValue(jsonData, ObjectNode.class);
+
             return new ServerStatus(
-                    data.get("players").get("online").asInt(),
-                    data.get("players").get("max").asInt(),
-                    playerNames
+                    obj.get("players").get("online").asInt(),
+                    obj.get("players").get("max").asInt(),
+                    StreamSupport.stream(obj.get("players").withArray("sample").spliterator(), false)
+                            .map(node -> node.get("name").asText())
+                            .collect(Collectors.toSet())
             );
-        } catch (IOException | InterruptedException e) {
-            throw new IOException("Failed to get server status.", e);
         }
     }
 }
